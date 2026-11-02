@@ -1,0 +1,170 @@
+# 麦动 KTV —— 云端编译工作流 (GitHub Actions)
+#
+# 作用：在 GitHub 云端免费构建 Android TV 安装包 (APK)，无需本机安装
+#       Android SDK / JDK / NDK（ijkplayer 的 native 库已预编译进仓库）。
+#
+# 如何运行：
+#   1. 把本文件提交并推送到你的 GitHub 仓库（如 along6688/maidong-ktv 的 main 分支）。
+#      —— 注意：本工作流会自动从原始工程仓库 coolwuzizai/maidong-ktv 拉取完整源码
+#         与 gradlew，因此你自己的仓库里【不需要】包含 Android 工程文件，只放本 workflow 即可。
+#   2. 打开仓库页面 → Actions → 选择 “麦动 KTV 云编译” → Run workflow。
+#      （也可直接 push / 打 v* 标签自动触发）
+#   3. 构建完成后，在 Actions 运行记录的 “Artifacts” 中下载 maidong-ktv-apk，
+#      解压得到 app-release.apk，拷贝到桌面即可安装到电视/点歌设备。
+#
+# 关于签名（重要）：
+#   仓库的 app/build.gradle 里 release 构建写死了签名文件 ../../ktv_keystore.jks，
+#   密码 storePassword/keyPassword = 123456，keyAlias = ktv。
+#   - 本工作流默认会自动生成一个临时 keystore（使用上述固定密码/别名），可直接编译通过。
+#   - 若要保证多次构建能用同一把密钥覆盖升级安装，请在仓库
+#     Settings → Secrets and variables → Actions 中添加一个名为
+#     KEYSTORE_BASE64 的 Secret，值为你自己 keystore 的 base64（且必须用
+#     上述 123456 / ktv 凭据）。生成方式见文件底部说明。
+
+name: 麦动 KTV 云编译 (Build APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: "构建类型"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+
+# 允许上传构建产物（Artifacts）与创建 Release
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK on Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---- 检出源码 ----
+      # 关键：本工作流所在的仓库（例如 along6688/maidong-ktv）往往只放了本 workflow 文件，
+      # 并没有 Android 工程源码与 gradlew，直接检出会导致后续 chmod gradlew 失败。
+      # 因此这里显式从【真正带完整工程与 gradlew 的原始仓库】拉取源码（公开库可匿名检出）。
+      # 若你希望编译自己 fork 后的定制版本，请把完整工程（含 gradlew）推到本仓库，
+      # 并把下面 repository 改回 ${{ github.repository }}、ref 改回 ${{ github.ref }}。
+      - name: 检出源码（拉取原始工程仓库 coolwuzizai/maidong-ktv）
+        uses: actions/checkout@v4
+        with:
+          repository: coolwuzizai/maidong-ktv
+          ref: master
+          fetch-depth: 1
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 安装 Android SDK (命令行工具)
+        uses: android-actions/setup-android@v3
+        with:
+          # 关键：必须显式关闭动作自带的“自动接受许可”。
+          # 该选项默认 true，但在新版 sdkmanager(cmdline-tools 16.0 / Ubuntu 26.04 上)
+          # 会卡在交互式 (y/N) 确认，导致整个 job 挂起并超时失败。
+          # 许可授权统一在下一步用 yes 管道处理。
+          accept-android-sdk-licenses: false
+          # 默认值是 "tools platform-tools"，其中 "tools" 包已被废弃移除，会直接报错；
+          # 这里只装 platform-tools（提供 adb，构建 APK 本身并不需要，但无害）。
+          packages: platform-tools
+
+      - name: 接受 Android SDK 许可协议并安装平台/构建工具 (compileSdk 35)
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          yes | sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      # ---- 准备签名 keystore ----
+      # 工作流默认生成临时 keystore；若配置了 KEYSTORE_BASE64 则优先使用。
+      - name: 准备签名 keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > ktv_keystore.jks
+            echo "已使用 Secrets 中的 keystore。"
+          else
+            echo "未配置 KEYSTORE_BASE64，自动生成临时 keystore（凭据 123456 / ktv）。"
+            keytool -genkeypair -v \
+              -keystore ktv_keystore.jks \
+              -storepass 123456 -keypass 123456 \
+              -alias ktv -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Maidong KTV, OU=Dev, O=Local, L=CN, ST=CN, C=CN"
+          fi
+          ls -l ktv_keystore.jks
+
+      - name: 赋予 gradlew 可执行权限
+        run: chmod +x gradlew
+
+      # Gradle 依赖缓存，加速后续构建
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 构建 Release APK
+        if: ${{ github.event.inputs.build_variant != 'debug' }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: 构建 Debug APK
+        if: ${{ github.event.inputs.build_variant == 'debug' }}
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: maidong-ktv-apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # 仅当推送 v* 标签（如 v1.1.0）时，自动发布到 GitHub Release
+      - name: 发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# ----------------------------------------------------------------------------
+# 附录：如何生成可复用的 keystore 并存入 GitHub Secrets
+#
+# 1) 本地生成 keystore（凭据需与 app/build.gradle 一致：123456 / ktv）：
+#      keytool -genkeypair -v \
+#        -keystore ktv_keystore.jks \
+#        -storepass 123456 -keypass 123456 \
+#        -alias ktv -keyalg RSA -keysize 2048 -validity 10000 \
+#        -dname "CN=Maidong KTV, OU=Dev, O=Local, L=CN, ST=CN, C=CN"
+#
+# 2) 转成 base64：
+#      # Linux / macOS:
+#      base64 -w0 ktv_keystore.jks > ktv_keystore.jks.b64
+#      # Windows (PowerShell):
+#      [Convert]::ToBase64String([IO.File]::ReadAllBytes("ktv_keystore.jks"))
+#
+# 3) 把 .b64 文本内容粘贴到仓库
+#      Settings → Secrets and variables → Actions → New repository secret
+#      名称填 KEYSTORE_BASE64，值填上面的 base64 串。
+#    之后每次云编译都会用同一把密钥签名，可正常覆盖升级安装。
+# ----------------------------------------------------------------------------
